@@ -33,7 +33,19 @@ pub fn run(
     // Without this, rg returns 0 matches for files in .gitignore, causing
     // false negatives that make AI agents draw wrong conclusions.
     // Using --no-ignore-vcs (not --no-ignore) so .ignore/.rgignore are still respected.
-    rg_cmd.args(["-n", "--no-heading", "--no-ignore-vcs", &rg_pattern, path]);
+    //
+    // --with-filename: force rg to always include the filename, even for
+    // single-file invocations. Without it, rg emits `<line>:<content>` for a
+    // single file, and the parser cannot tell `<line>:<content>` from
+    // `<file>:<line>:<content>` when content itself contains ':' (issue #1436).
+    rg_cmd.args([
+        "-n",
+        "--no-heading",
+        "--with-filename",
+        "--no-ignore-vcs",
+        &rg_pattern,
+        path,
+    ]);
 
     if let Some(ft) = file_type {
         rg_cmd.arg("--type").arg(ft);
@@ -50,8 +62,9 @@ pub fn run(
     let result = exec_capture(&mut rg_cmd)
         .or_else(|_| {
             let mut grep_cmd = resolved_command("grep");
-            //When we fall back to grep,include all args, not just -rn.
-            grep_cmd.args(["-rn", pattern, path]).args(extra_args);
+            // -H: always emit the filename so the parser sees a uniform
+            // file:line:content shape (parity with rg's --with-filename).
+            grep_cmd.args(["-rnH", pattern, path]).args(extra_args);
             exec_capture(&mut grep_cmd)
         })
         .context("grep/rg failed")?;
@@ -108,18 +121,9 @@ pub fn run(
 
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     for line in result.stdout.lines() {
-        let parts: Vec<&str> = line.splitn(3, ':').collect();
-
-        let (file, line_num, content) = if parts.len() == 3 {
-            let ln = parts[1].parse().unwrap_or(0);
-            (parts[0].to_string(), ln, parts[2])
-        } else if parts.len() == 2 {
-            let ln = parts[0].parse().unwrap_or(0);
-            (path.to_string(), ln, parts[1])
-        } else {
+        let Some((file, line_num, content)) = parse_match_line(line) else {
             continue;
         };
-
         let cleaned = clean_line(content, max_line_len, context_re.as_ref(), pattern);
         by_file.entry(file).or_default().push((line_num, cleaned));
     }
@@ -164,6 +168,29 @@ pub fn run(
     );
 
     Ok(exit_code)
+}
+
+/// Parses a single rg/grep match line of the form `file:line_number:content`.
+///
+/// Always returns three colon-separated fields when the underlying command was
+/// invoked with `--with-filename` (rg) or `-H` (grep). Uses a greedy regex on
+/// the path so:
+///   - content with `::` (e.g. `ClassRegistry::init(...)`) does not split into
+///     a phantom file bucket (issue #1436);
+///   - paths with embedded `:` (Windows drive letters like `C:\foo\file.php`)
+///     parse correctly — the LAST `:digits:` before content is the boundary.
+///
+/// Returns `None` for lines that do not match the expected shape (e.g. rg
+/// `-A`/`-B` context lines that use `-` as separator).
+fn parse_match_line(line: &str) -> Option<(String, usize, &str)> {
+    lazy_static::lazy_static! {
+        static ref MATCH_LINE_RE: Regex = Regex::new(r"^(.+):(\d+):(.*)$").unwrap();
+    }
+    let caps = MATCH_LINE_RE.captures(line)?;
+    let file = caps.get(1)?.as_str().to_string();
+    let line_num: usize = caps.get(2)?.as_str().parse().ok()?;
+    let content_start = caps.get(3)?.start();
+    Some((file, line_num, &line[content_start..]))
 }
 
 fn has_format_flag(extra_args: &[String]) -> bool {
@@ -389,6 +416,63 @@ mod tests {
             );
         }
         // If rg is not installed, skip gracefully (test still passes)
+    }
+
+    // --- issue #1436: parse_match_line robustness ---
+
+    #[test]
+    fn test_parse_match_line_simple() {
+        let line = "file.php:10:use Foo\\Bar;";
+        let (file, line_num, content) = parse_match_line(line).unwrap();
+        assert_eq!(file, "file.php");
+        assert_eq!(line_num, 10);
+        assert_eq!(content, "use Foo\\Bar;");
+    }
+
+    // Issue #1436 reproducer: content with `::` must not split into a phantom
+    // file bucket. Before the fix, rg's single-file output `81:        $this->...
+    // ClassRegistry::init('...')` was parsed into 3 colon-fields, producing
+    // file="81", line=0, content=":init('...')".
+    #[test]
+    fn test_parse_match_line_content_with_double_colon() {
+        let line = "externalImportShell.class.php:81:        $this->queueProcessModel = ClassRegistry::init('Collections.QueueProcess');";
+        let (file, line_num, content) = parse_match_line(line).unwrap();
+        assert_eq!(file, "externalImportShell.class.php");
+        assert_eq!(line_num, 81);
+        assert_eq!(
+            content,
+            "        $this->queueProcessModel = ClassRegistry::init('Collections.QueueProcess');"
+        );
+    }
+
+    // Windows abs-path safety: drive letter + backslashes must not break the
+    // parser. Greedy regex on path picks the LAST `:digits:` boundary.
+    #[test]
+    fn test_parse_match_line_windows_path() {
+        let line = r"C:\src\file.rs:42:fn main() {}";
+        let (file, line_num, content) = parse_match_line(line).unwrap();
+        assert_eq!(file, r"C:\src\file.rs");
+        assert_eq!(line_num, 42);
+        assert_eq!(content, "fn main() {}");
+    }
+
+    #[test]
+    fn test_parse_match_line_malformed_returns_none() {
+        // Single token, no colons (e.g. an rg context line written with `-`)
+        assert!(parse_match_line("not a match line").is_none());
+        // Missing line number
+        assert!(parse_match_line("file.rs:fn foo()").is_none());
+        // Empty
+        assert!(parse_match_line("").is_none());
+    }
+
+    #[test]
+    fn test_parse_match_line_empty_content() {
+        let line = "file.rs:7:";
+        let (file, line_num, content) = parse_match_line(line).unwrap();
+        assert_eq!(file, "file.rs");
+        assert_eq!(line_num, 7);
+        assert_eq!(content, "");
     }
 
     #[test]
