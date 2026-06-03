@@ -146,12 +146,12 @@ fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
     }
 }
 
-fn decide_hook_action(cmd: &str) -> HookDecision {
-    decide_from_verdict(cmd, permissions::check_command(cmd))
+fn decide_hook_action(cmd: &str, host: permissions::Host) -> HookDecision {
+    decide_from_verdict(cmd, permissions::check_command_for(cmd, host))
 }
 
 fn handle_vscode(cmd: &str) -> Result<()> {
-    let (decision, rewritten) = match decide_hook_action(cmd) {
+    let (decision, rewritten) = match decide_hook_action(cmd, permissions::Host::Claude) {
         HookDecision::Deny => {
             audit_log("deny", cmd, "");
             return Ok(());
@@ -183,7 +183,14 @@ fn handle_copilot_cli(cmd: &str, args: &Value) -> Result<()> {
 }
 
 fn copilot_cli_response(cmd: &str, args: &Value) -> Option<Value> {
-    copilot_cli_response_from_decision(args, decide_hook_action(cmd), cmd)
+    // Copilot CLI v1.0.54 itself reads `.claude/settings.json` for permission
+    // rules (see the binary), so routing through `Host::Claude` keeps RTK's
+    // verdict consistent with what Copilot would have decided on its own.
+    copilot_cli_response_from_decision(
+        args,
+        decide_hook_action(cmd, permissions::Host::Claude),
+        cmd,
+    )
 }
 
 fn copilot_cli_response_from_decision(
@@ -243,7 +250,7 @@ pub fn run_gemini() -> Result<()> {
         return Ok(());
     }
 
-    match decide_hook_action(cmd) {
+    match decide_hook_action(cmd, permissions::Host::Gemini) {
         HookDecision::Deny => {
             let _ = writeln!(
                 io::stdout(),
@@ -345,7 +352,7 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         None => return PayloadAction::Ignore,
     };
 
-    let (rewritten, allow) = match decide_hook_action(cmd) {
+    let (rewritten, allow) = match decide_hook_action(cmd, permissions::Host::Claude) {
         HookDecision::Deny => {
             return PayloadAction::Skip {
                 reason: "skip:deny_rule",
@@ -478,7 +485,7 @@ pub fn run_cursor() -> Result<()> {
         }
     };
 
-    let output = match decide_hook_action(&cmd) {
+    let output = match decide_hook_action(&cmd, permissions::Host::Cursor) {
         HookDecision::AllowRewrite(rewritten) => {
             audit_log("rewrite", &cmd, &rewritten);
             cursor_allow(&rewritten)
