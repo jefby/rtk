@@ -183,9 +183,6 @@ fn handle_copilot_cli(cmd: &str, args: &Value) -> Result<()> {
 }
 
 fn copilot_cli_response(cmd: &str, args: &Value) -> Option<Value> {
-    // Copilot CLI v1.0.54 itself reads `.claude/settings.json` for permission
-    // rules (see the binary), so routing through `Host::Claude` keeps RTK's
-    // verdict consistent with what Copilot would have decided on its own.
     copilot_cli_response_from_decision(
         args,
         decide_hook_action(cmd, permissions::Host::Claude),
@@ -675,28 +672,24 @@ mod tests {
 
     #[test]
     fn test_copilot_cli_deny_returns_none() {
-        assert!(
-            copilot_cli_response_from_decision(
-                &cli_args("cargo test"),
-                HookDecision::Deny,
-                "cargo test",
-            )
-            .is_none()
-        );
+        assert!(copilot_cli_response_from_decision(
+            &cli_args("cargo test"),
+            HookDecision::Deny,
+            "cargo test",
+        )
+        .is_none());
     }
 
     #[test]
     fn test_copilot_cli_defer_returns_none() {
         // Defer covers both "no rewrite available" and the unattestable-construct gate.
         // The hook must emit NO modifiedArgs for CVE bypass forms — no laundering.
-        assert!(
-            copilot_cli_response_from_decision(
-                &cli_args("git status & rm -rf /tmp/x"),
-                HookDecision::Defer,
-                "git status & rm -rf /tmp/x",
-            )
-            .is_none()
-        );
+        assert!(copilot_cli_response_from_decision(
+            &cli_args("git status & rm -rf /tmp/x"),
+            HookDecision::Defer,
+            "git status & rm -rf /tmp/x",
+        )
+        .is_none());
     }
 
     #[test]
@@ -747,6 +740,82 @@ mod tests {
         assert_eq!(modified["description"], "install ripgrep");
         assert_eq!(modified["initial_wait"], 30);
         assert_eq!(modified["mode"], "sync");
+    }
+
+    fn end_to_end(cmd: &str) -> Option<Value> {
+        let verdict = crate::hooks::permissions::check_command_with_rules(
+            cmd,
+            &[],
+            &[],
+            &["Bash(git:*)".to_string()],
+        );
+        copilot_cli_response_from_decision(&cli_args(cmd), decide_from_verdict(cmd, verdict), cmd)
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_safe_forms_still_rewrite() {
+        for cmd in ["git status", "git status 2>&1"] {
+            let r = end_to_end(cmd).unwrap_or_else(|| panic!("expected rewrite for {cmd:?}"));
+            assert_eq!(
+                r["modifiedArgs"]["command"].as_str().unwrap(),
+                format!("rtk {cmd}"),
+                "safe form {cmd:?} must rewrite",
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_newline_bypass_never_auto_allows() {
+        let r = end_to_end("git status\nrm -rf /tmp/x");
+        if let Some(resp) = r {
+            assert!(
+                resp.get("permissionDecision").is_none(),
+                "newline-hidden command must not produce permissionDecision: \"allow\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_background_bypass_never_auto_allows() {
+        let r = end_to_end("git status & rm -rf /tmp/x");
+        if let Some(resp) = r {
+            assert!(
+                resp.get("permissionDecision").is_none(),
+                "background-& hidden command must not produce permissionDecision: \"allow\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_command_substitution_returns_none() {
+        assert!(
+            end_to_end("git log --pretty=$(rm -rf /tmp/x)").is_none(),
+            "$( ) command substitution must not produce modifiedArgs"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_backtick_substitution_returns_none() {
+        assert!(
+            end_to_end("git log --pretty=`rm -rf /tmp/x`").is_none(),
+            "backtick substitution must not produce modifiedArgs"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_file_redirect_amp_returns_none() {
+        assert!(
+            end_to_end("git status >& /tmp/evil").is_none(),
+            ">&file redirect must not produce modifiedArgs"
+        );
+    }
+
+    #[test]
+    fn test_copilot_cli_cve_file_redirect_returns_none() {
+        assert!(
+            end_to_end("git status > /tmp/evil").is_none(),
+            ">file redirect must not produce modifiedArgs"
+        );
     }
 
     // --- Gemini format ---
